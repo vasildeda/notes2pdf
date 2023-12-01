@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+import os, sqlite3, json, math, struct, re, zipfile, sys
+from zlib import decompress
+from fpdf import FPDF
+import xml.etree.ElementTree as ET
+
+# protobuf parser
+
+def uvarint(data,pos):
+    x = s = 0
+    while True:
+        b = data[pos]
+        pos += 1
+        x = x | ((b&0x7f)<<s)
+        if b < 0x80: return x,pos
+        s += 7
+
+def readbytes(data,pos):
+    l,pos = uvarint(data,pos)
+    return data[pos:pos+l], pos+l
+
+def readstruct(fmt,l):
+    return lambda data,pos: (struct.unpack_from(fmt,data,pos)[0],pos+l)
+
+readers = [ uvarint, readstruct('<d',8), readbytes, None, None, readstruct('<f',4) ]
+
+def parse(data, schema):
+    "parses a protobuf"
+    obj = {}
+    pos = 0
+    while pos < len(data):
+        val,pos = uvarint(data,pos)
+        typ = val & 7
+        key = val >> 3
+        val, pos = readers[typ](data,pos)
+        if key not in schema: 
+            continue
+        name, repeated, typ = schema[key]
+        if isinstance(typ, dict):
+            val = parse(val, typ)
+        if typ == 'string':
+            val = val.decode('utf8')
+        if repeated:
+            val = obj.get(name,[]) + [val]
+        obj[name] = val
+    return obj
+
+def process_archive(table):
+    "Decode a 'CRArchive'"
+    objects = []
+
+    def dodict(v):
+        rval = {}
+        for e in v.get('element',[]):
+            rval[coerce(e['key'])] = coerce(e['value'])
+        return rval
+
+    def coerce(o):
+        [(k,v)]= o.items()
+        if 'custom' == k:
+            rval = dict((table['keyItem'][e['key']],coerce(e['value'])) for e in v['mapEntry'])
+            typ = table['typeItem'][v['type']]
+            if typ == 'com.apple.CRDT.NSUUID':
+                return table['uuidItem'][rval['UUIDIndex']]
+            if typ == 'com.apple.CRDT.NSString':
+                return rval['self']
+            return rval
+        if k == 'objectIndex':
+            return coerce(table['object'][v])
+        if k == 'registerLatest':
+            return coerce(v['contents'])
+        if k == 'orderedSet':
+            elements = dodict(v['elements'])
+            contents = dodict(v['ordering']['contents'])
+            rval = []
+            for a in v['ordering']['array']['attachments']:
+                value = contents[a['uuid']]
+                if value not in rval and a['uuid'] in elements:
+                    rval.append(value)
+            return rval
+        if k == 'dictionary':
+            return dodict(v)
+        if k in ('stringValue','unsignedIntegerValue','string'):
+            return v
+        raise Exception(f"unhandled type {k}")
+
+    return coerce(table['object'][0])
+
+def render_table(table):
+    "Render a table to html"
+    table = process_archive(table)
+    rval = E('table')
+    for row in table['crRows']:
+        tr = E('tr')
+        rval.append(tr)
+        for col in table['crColumns']:
+            cell = table.get('cellColumns').get(col,{}).get(row)
+            td = E('td',render_html(cell))
+            rval.append(td)
+    return rval
+
+s_string = {
+    2: [ "string", 0, "string"],
+    5: [ "attributeRun", 1, {
+        1: ["length",0,0],
+        2: ["paragraphStyle", 0, {
+            1: ["style", 0,0],
+            4: ["indent",0,0],
+            5: ["todo",0,{ 
+                1: ["todoUUID", 0, "bytes"],
+                2: ["done",0,0]
+            }]
+        }],
+        5: ["fontHints",0,0],
+        6: ["underline",0,0],
+        7: ["strikethrough",0,0],
+        9: ["link",0,"string"],
+        12: [ "attachmentInfo", 0, {
+            1: [ "attachmentIdentifier", 0, "string"],
+            2: [ "typeUTI", 0, "string"]
+        }]
+    }]
+}
+
+s_doc = { 2: ["version", 1, { 3: ["data", 0, s_string ]}]}
+
+s_drawing = { 2: ["version", 1, { 3: ["data", 0, {
+            4: ["inks",1, {
+                1:["color",0,{1:["red",0,0],2:["green",0,0],3:["blue",0,0],4:["alpha",0,0]}],
+                2:["identifier",0,"string"]
+            }],
+            5: ["strokes",1, {
+                3:["inkIndex",0,0],
+                5:["points",0,"bytes"],
+                9:["hidden",0,0],
+                10: ["transform",0,{1:["a",0,0],2:["b",0,0],3:["c",0,0],4:["d",0,0],5:["tx",0,0],6:["ty",0,0]}]
+            }],
+            8: ["bounds", 0, {1:["originX",0,0],2:["originY",0,0],3:["width",0,0],4:["height",0,0]}]
+        }]
+    }
+]}
+
+# this essentially is a variant type
+s_oid = { 2:["unsignedIntegerValue",0,0], 4:["stringValue",0,'string'], 6:["objectIndex",0,0] }
+s_dictionary = {1:["element",1,{ 1:["key",0,s_oid], 2:["value",0,s_oid]}]}
+s_table = { 2: ["version", 1, { 3: ["data", 0, {
+    3: ["object",1,{
+        1:["registerLatest",0,{2:["contents",0,s_oid]}],
+        6:["dictionary",0,s_dictionary],
+        10:["string",0,s_string],
+        13:["custom",0,{
+            1:["type",0,0],
+            3:["mapEntry",1,{
+                1:["key",0,0],
+                2:["value",0,s_oid]
+            }]
+        }],
+        16:["orderedSet",0,{
+            1: ["ordering",0, {
+                1:["array",0,{
+                    1:["contents",0,s_string],
+                    2:["attachments",1,{1:["index",0,0],2:["uuid",0,0]}]
+                }],
+                2:["contents",0,s_dictionary]
+            }],
+            2: ["elements",0,s_dictionary]
+        }]
+    }],
+    4:["keyItem",1,"string"],
+    5:["typeItem",1,"string"],
+    6:["uuidItem",1,"bytes"]
+}]}]}
+
+TOP_PAGE = 10.
+HALF_PAGE = 105.
+
+class PDF(FPDF):
+    def __init__(self, title):
+        super().__init__(format='A5')
+        self.title = title
+        self.add_font('newyork', '', 'NewYork.ttf')
+        self.add_font('newyork', 'B', 'NewYork.ttf')
+        self.add_font('newyork', 'I', 'NewYork.ttf')
+        self.add_font('monaco', '', 'Monaco.ttf')
+        self.add_font('monaco', 'B', 'Monaco.ttf')
+
+        self.set_font("newyork", size=12)
+        self.add_page()
+
+    def note(self, note):
+        text = note["doc"]["string"]
+
+        if self.get_y() > HALF_PAGE:
+            self.add_page()
+        elif self.get_y() == HALF_PAGE:
+            lines = len(text.splitlines())
+            if lines > 13:
+                self.add_page()
+        elif self.get_y() > TOP_PAGE:
+            self.set_y(HALF_PAGE)
+
+        self.write(6, text)
+        self.ln()
+
+
+if __name__ == '__main__':
+    css = '''
+.underline { text-decoration: underline; }
+.strikethrough { text-decoration: line-through; }
+.todo { list-style-type: none; margin-left: -20px; }
+.dashitem { list-style-type: none; }
+.dashitem:before { content: "-"; text-indent: -5px }
+'''
+
+    def help():
+        print(f'Usage:\n')
+        print(f'   {sys.argv[0]} dest')
+        print(f'   dest     destination directory')
+        print()
+        exit(-1)
+
+    dest = None
+    for x in sys.argv[1:]:
+        if x.startswith('--'):
+            help()
+        else:
+            dest = x
+
+    if not dest:
+        help()
+
+    db = sqlite3.Connection('./group.com.apple.notes/NoteStore.sqlite')
+
+    nquery = '''select a.zidentifier, a.ztitle1, n.zdata, datetime(a.zcreationdate3,'unixepoch','31 years', '1 days', 'localtime') created from zicnotedata n join ziccloudsyncingobject a on a.znotedata = n.z_pk 
+        where n.zcryptotag is null and zdata is not null order by created'''
+
+    books = {}
+    for id,title,data,created in db.execute(nquery):
+        y = created[0:4]
+        m = int(created[5:7])
+        q = math.ceil(m/3)
+        book = "{}-Q{}".format(y, q)
+        pb = decompress(data,47)
+        doc = parse(pb,s_doc)['version'][0]['data']
+
+        note = {"doc": doc, "title": title, "created": created}
+
+        if book not in books:
+            books[book] = list()
+
+        books[book].append(note)
+
+    for book, notes in books.items():
+        pdf = PDF(book)
+
+        for note in notes:
+            pdf.note(note)
+
+        path = os.path.join(dest, book + ".pdf")
+        pdf.output(path)
